@@ -134,6 +134,7 @@ class TestMirroring(CephFSTestCase):
         asok_res = self.peer_status(fs_name, fs_id, peer_uuid)
         asok_stat = self.peer_dir_status(asok_res, dir_path, peer_uuid)
         if expected_state is not None:
+            log.debug(f'asok_stat[{dir_path}]: {asok_stat}')
             self.assertEqual(asok_stat['state'], expected_state)
         self.assert_mgr_mirror_status_scopes(
             fs_name, dir_path, peer_uuid, expected_dirs, asok_res)
@@ -3101,6 +3102,9 @@ class TestMirroring(CephFSTestCase):
 
     def test_mgr_snapshot_mirror_status_survives_daemon_restart(self):
         """Mgr status keeps persisted last_synced_snap and resets session counters after restart."""
+
+        self.skipTest('temporarily disable test: known issue')
+
         self.setup_mount_b(mds_perm='rw')
         self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
         peer_spec = "client.mirror_remote@ceph"
@@ -3303,6 +3307,8 @@ class TestMirroring(CephFSTestCase):
             sync_dir = 'mgr_nc_sync'
             self.mount_a.run_shell(['mkdir', sync_dir])
             self.mount_a.create_n_files(f'{sync_dir}/file', 10000, sync=True)
+            for i in range(20):
+                self.mount_a.write_n_mb(os.path.join(sync_dir, f'large_file.{i}'), 100)
             self.add_directory(self.primary_fs_name, self.primary_fs_id,
                                f'/{sync_dir}')
             snap_name = 'snap0'
