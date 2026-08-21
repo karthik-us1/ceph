@@ -14,7 +14,7 @@ from collections import deque
 from datetime import datetime
 
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
-from teuthology.exceptions import CommandFailedError
+from teuthology.exceptions import CommandFailedError, MaxWhileTries
 from teuthology.contextutil import safe_while
 from teuthology.orchestra import run
 
@@ -47,21 +47,26 @@ def retry_assert(timeout=60, interval=1):
             last_exc = None
             attempt = 1
 
-            with safe_while(sleep=interval, tries=tries, action=f"retry {func.__name__}") as proceed:
-                while proceed():
-                    try:
-                        return func(*args, **kwargs)
-                    except RETRY_EXCEPTIONS as e:
-                        last_exc = e
-                        log.debug(
-                            f"[retry_assert] {func.__name__}: "
-                            f"attempt {attempt} failed ({type(e).__name__}), retrying..."
-                        )
-                        attempt += 1
-            # Final failure
+            try:
+                with safe_while(sleep=interval, tries=tries,
+                                action=f"retry {func.__name__}") as proceed:
+                    while proceed():
+                        try:
+                            return func(*args, **kwargs)
+                        except RETRY_EXCEPTIONS as e:
+                            last_exc = e
+                            log.debug(
+                                f"[retry_assert] {func.__name__}: "
+                                f"attempt {attempt} failed ({type(e).__name__}), retrying..."
+                            )
+                            attempt += 1
+            except MaxWhileTries:
+                pass
+
+            # Final failure — log last peer status if the helper attached it
             if last_exc is not None and hasattr(last_exc, "res"):
                 log.error("\n--- Last peer status (res) ---")
-                log.error(last_exc.res)
+                log.error("%s", last_exc.res)
 
             raise AssertionError(
                 f"{func.__name__} did not succeed within {timeout}s "
@@ -783,8 +788,9 @@ class TestMirroring(CephFSTestCase):
 
     @retry_assert(timeout=60, interval=1)
     def check_peer_snap_in_progress(self, fs_name, fs_id,
-                                    peer_spec, dir_name, snap_name, timeout=60, interval=1):
+                                    peer_spec, dir_name, snap_name):
         peer_uuid = self.get_peer_uuid(peer_spec)
+        res = None
         try:
             res = self.mirror_daemon_command(f'peer status for fs: {fs_name}',
                                              'fs', 'mirror', 'peer', 'status',
@@ -1786,6 +1792,39 @@ class TestMirroring(CephFSTestCase):
         res = self.checkpoint_list(self.primary_fs_name, dir_path)
         cp = self.find_checkpoint(res['checkpoints'], snap_name)
         self.assertNotIn('error_msg', cp)
+
+        self._teardown_mirroring(dir_path, peer_spec)
+
+    def test_checkpoint_remove_during_sync(self):
+        """Removing a checkpoint during sync must not recreate it on completion."""
+        dir_path = '/cp_remove_sync'
+        snap_name = 'snap0'
+        peer_spec = "client.mirror_remote@ceph"
+
+        self._setup_mirrored_directory(dir_path, mount_b=True)
+        dir_name = dir_path.lstrip('/')
+        # Keep sync in progress past peer_add()'s 10s settle sleep (~10GiB bulk).
+        self.mount_a.create_n_files(f'{dir_name}/file', 20000, sync=True)
+        for i in range(10):
+            self.mount_a.write_n_mb(os.path.join(dir_name, f'large_file.{i}'), 1024)
+        self._add_checkpoint_snapshot(dir_path, snap_name)
+        self.check_checkpoint_status(self.primary_fs_name, dir_path, snap_name, 'created')
+
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, peer_spec,
+                      self.secondary_fs_name)
+        self.check_peer_snap_in_progress(self.primary_fs_name, self.primary_fs_id,
+                                         peer_spec, dir_path, snap_name)
+
+        self.checkpoint_remove(self.primary_fs_name, dir_path, snap_name)
+        res = self.checkpoint_list(self.primary_fs_name, dir_path)
+        self.assertEqual(res['checkpoints'], [])
+
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               peer_spec, dir_path, snap_name, 1)
+        self.verify_snapshot(dir_name, snap_name)
+
+        res = self.checkpoint_list(self.primary_fs_name, dir_path)
+        self.assertEqual(res['checkpoints'], [])
 
         self._teardown_mirroring(dir_path, peer_spec)
 
